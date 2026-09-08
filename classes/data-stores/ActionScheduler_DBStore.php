@@ -63,6 +63,57 @@ class ActionScheduler_DBStore extends ActionScheduler_Store {
 		$table_maker = new ActionScheduler_StoreSchema();
 		$table_maker->init();
 		$table_maker->register_tables();
+
+		add_action( 'action_scheduler_run_actions_cleanup_hook', array( $this, 'release_stale_unique_action_keys' ), 10, 0 );
+		add_action( 'action_scheduler_continue_actions_cleanup_hook', array( $this, 'release_stale_unique_action_keys' ), 10, 0 );
+	}
+
+	/**
+	 * Release keys left behind by custom terminal-status transitions, without deleting action history.
+	 *
+	 * @internal
+	 * @return void
+	 * @throws RuntimeException When stale keys cannot be released.
+	 */
+	public function release_stale_unique_action_keys() {
+		global $wpdb;
+
+		$released = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$wpdb->actionscheduler_actions}
+				SET unique_key = NULL
+				WHERE status IN (%s, %s, %s) AND unique_key IS NOT NULL
+				ORDER BY action_id
+				LIMIT 1000",
+				self::STATUS_COMPLETE,
+				self::STATUS_FAILED,
+				self::STATUS_CANCELED
+			)
+		);
+
+		if ( false === $released ) {
+			throw new RuntimeException( 'Unable to release stale unique action keys: ' . esc_html( $wpdb->last_error ) );
+		}
+
+		if ( 1000 !== $released ) {
+			return;
+		}
+
+		$continuation_hook = 'action_scheduler_continue_actions_cleanup_hook';
+		$called_from_run   = doing_action( 'action_scheduler_run_actions_cleanup_hook' );
+		$pending           = as_get_scheduled_actions(
+			array(
+				'hook'     => $continuation_hook,
+				'status'   => self::STATUS_PENDING,
+				'per_page' => 1,
+			),
+			'ids'
+		);
+
+		// A running continuation must not prevent another batch from being scheduled.
+		if ( empty( $pending ) ) {
+			as_schedule_single_action( time(), $continuation_hook, array(), 'ActionScheduler', $called_from_run, 0 );
+		}
 	}
 
 	/**

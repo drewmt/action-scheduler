@@ -828,6 +828,136 @@ class ActionScheduler_DBStore_Test extends AbstractStoreTest {
 	}
 
 	/**
+	 * Scheduled cleanup repairs terminal rows without deleting their history.
+	 */
+	public function test_scheduled_cleanup_releases_stale_unique_action_keys() {
+		global $wpdb;
+
+		$store    = new ActionScheduler_DBStore();
+		$schedule = new ActionScheduler_SimpleSchedule( as_get_datetime_object() );
+		$actions  = array();
+		$statuses = array( ActionScheduler_Store::STATUS_COMPLETE, ActionScheduler_Store::STATUS_FAILED, ActionScheduler_Store::STATUS_CANCELED );
+		$store->init();
+
+		foreach ( $statuses as $status ) {
+			$action    = new ActionScheduler_Action( 'stale_unique_' . $status, array(), $schedule );
+			$action_id = $store->save_unique_action( $action );
+			// Simulate an older store override that updates the status without releasing the key.
+			$wpdb->update(
+				$wpdb->actionscheduler_actions,
+				array(
+					'status'           => $status,
+					'last_attempt_gmt' => gmdate( 'Y-m-d H:i:s' ),
+				),
+				array( 'action_id' => $action_id )
+			);
+			$this->assertSame( 0, $store->save_unique_action( $action ) );
+			$actions[ $action_id ] = $action;
+		}
+
+		do_action( 'action_scheduler_run_actions_cleanup_hook' ); // phpcs:ignore WooCommerce.Commenting.CommentHooks -- Invoke an existing hook, not a new declaration.
+
+		foreach ( $actions as $action_id => $action ) {
+			$this->assertNotSame( 0, $store->save_unique_action( $action ) );
+			$this->assertContains( $store->get_status( $action_id ), $statuses, 'Cleanup must retain action history.' );
+		}
+	}
+
+	/**
+	 * Cleanup must not release keys belonging to pending or running actions.
+	 */
+	public function test_scheduled_cleanup_preserves_active_unique_action_keys() {
+		$store    = new ActionScheduler_DBStore();
+		$schedule = new ActionScheduler_SimpleSchedule( as_get_datetime_object() );
+		$pending  = new ActionScheduler_Action( 'pending_unique_cleanup', array(), $schedule );
+		$running  = new ActionScheduler_Action( 'running_unique_cleanup', array(), $schedule );
+		$store->init();
+
+		$pending_id = $store->save_unique_action( $pending );
+		$running_id = $store->save_unique_action( $running );
+		$store->log_execution( $running_id );
+
+		do_action( 'action_scheduler_run_actions_cleanup_hook' ); // phpcs:ignore WooCommerce.Commenting.CommentHooks -- Invoke an existing hook, not a new declaration.
+
+		$this->assertSame( 0, $store->save_unique_action( $pending ) );
+		$this->assertSame( 0, $store->save_unique_action( $running ) );
+		$this->assertSame( ActionScheduler_Store::STATUS_PENDING, $store->get_status( $pending_id ) );
+		$this->assertSame( ActionScheduler_Store::STATUS_RUNNING, $store->get_status( $running_id ) );
+	}
+
+	/**
+	 * Bounded cleanup continues past a running batch and reuses a pending continuation.
+	 */
+	public function test_stale_unique_key_cleanup_continues_while_cleanup_is_running() {
+		global $wpdb;
+
+		$store             = new ActionScheduler_DBStore();
+		$continuation_hook = 'action_scheduler_continue_actions_cleanup_hook';
+		$running_id        = as_schedule_single_action( time(), $continuation_hook, array(), 'ActionScheduler', true, 0 );
+		ActionScheduler::store()->log_execution( $running_id );
+
+		$values = array();
+		for ( $i = 0; $i < 2001; $i++ ) {
+			$values[] = $wpdb->prepare( '(%s, %s, %s, %s)', 'stale_cleanup_batch', ActionScheduler_Store::STATUS_COMPLETE, 'stale-' . $i, gmdate( 'Y-m-d H:i:s' ) );
+		}
+		$wpdb->query( "INSERT INTO {$wpdb->actionscheduler_actions} (hook, status, unique_key, last_attempt_gmt) VALUES " . implode( ', ', $values ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+
+		// Execute only this store callback, retaining WordPress's running-hook context.
+		$callbacks = clone $GLOBALS['wp_filter'][ $continuation_hook ];
+		remove_all_actions( $continuation_hook );
+		add_action( $continuation_hook, array( $store, 'release_stale_unique_action_keys' ), 10, 0 );
+		try {
+			do_action( $continuation_hook ); // phpcs:ignore WooCommerce.Commenting.CommentHooks -- Invoke an existing hook, not a new declaration.
+		} finally {
+			$GLOBALS['wp_filter'][ $continuation_hook ] = $callbacks; // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited -- Restore the callbacks isolated by this test.
+		}
+
+		$remaining_sql = "SELECT COUNT(*) FROM {$wpdb->actionscheduler_actions} WHERE hook = 'stale_cleanup_batch' AND unique_key IS NOT NULL";
+		$this->assertSame( '1001', $wpdb->get_var( $remaining_sql ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+		$pending_query = array(
+			'hook'     => $continuation_hook,
+			'status'   => ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 10,
+		);
+		$pending       = as_get_scheduled_actions( $pending_query, 'ids' );
+		$this->assertCount( 1, $pending, 'A running continuation must allow the next batch.' );
+
+		$store->release_stale_unique_action_keys();
+		$this->assertSame( '1', $wpdb->get_var( $remaining_sql ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+		$this->assertSame( $pending, as_get_scheduled_actions( $pending_query, 'ids' ), 'Reuse an already pending continuation.' );
+
+		$store->release_stale_unique_action_keys();
+		$this->assertSame( '0', $wpdb->get_var( $remaining_sql ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+		$this->assertSame( '2001', $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->actionscheduler_actions} WHERE hook = 'stale_cleanup_batch'" ) );
+		$this->assertSame( ActionScheduler_Store::STATUS_RUNNING, ActionScheduler::store()->get_status( $running_id ) );
+	}
+
+	/**
+	 * A failed update must not schedule another cleanup batch.
+	 */
+	public function test_stale_unique_key_cleanup_reports_database_failure() {
+		global $wpdb;
+
+		$original_wpdb                 = $wpdb;
+		$wpdb                          = $this->getMockBuilder( wpdb::class )->disableOriginalConstructor()->onlyMethods( array( 'query', 'prepare' ) )->getMock(); // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited -- Simulate a database failure without damaging the test schema.
+		$wpdb->actionscheduler_actions = $original_wpdb->actionscheduler_actions;
+		$wpdb->last_error              = 'Cleanup test failure';
+		$wpdb->expects( $this->once() )->method( 'query' )->willReturn( false );
+		$wpdb->method( 'prepare' )->willReturnCallback( array( $original_wpdb, 'prepare' ) );
+
+		try {
+			( new ActionScheduler_DBStore() )->release_stale_unique_action_keys();
+			$this->fail( 'A failed update must be reported.' );
+		} catch ( RuntimeException $exception ) {
+			$this->assertSame( 'Unable to release stale unique action keys: Cleanup test failure', $exception->getMessage() );
+		} finally {
+			$wpdb = $original_wpdb; // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited -- Restore the database connection after the simulated failure.
+		}
+
+		$this->assertFalse( as_has_scheduled_action( 'action_scheduler_continue_actions_cleanup_hook' ) );
+	}
+
+	/**
 	 * Test that bulk cancellation releases unique keys.
 	 */
 	public function test_bulk_cancel_releases_unique_action_key() {
